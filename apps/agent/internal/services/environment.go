@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/VAIBHAVSING/Dev8.dev/apps/agent/internal/azure"
@@ -13,18 +14,20 @@ import (
 
 // EnvironmentService handles environment lifecycle operations
 type EnvironmentService struct {
-	config         *config.Config
-	azureClient    *azure.Client
-	storageClients map[string]*azure.StorageClient
+	config             *config.Config
+	azureClient        *azure.Client
+	storageClients     map[string]*azure.StorageClient
+	deploymentStrategy *DeploymentStrategy
 }
 
 // NewEnvironmentService creates a new environment service
 func NewEnvironmentService(cfg *config.Config, azureClient *azure.Client) (*EnvironmentService, error) {
 	// No database requirement - Agent is stateless
 	service := &EnvironmentService{
-		config:         cfg,
-		azureClient:    azureClient,
-		storageClients: make(map[string]*azure.StorageClient),
+		config:             cfg,
+		azureClient:        azureClient,
+		storageClients:     make(map[string]*azure.StorageClient),
+		deploymentStrategy: NewDeploymentStrategy(cfg, azureClient),
 	}
 
 	// Initialize storage clients for all regions
@@ -71,10 +74,8 @@ func (s *EnvironmentService) CreateEnvironment(ctx context.Context, req *models.
 	log.Printf("🚀 Creating workspace %s (region: %s)", workspaceID, req.CloudRegion)
 	overallStartTime := time.Now()
 
-	// Azure resource names based on UUID
-	fileShareName := fmt.Sprintf("fs-%s", workspaceID)       // fs-clxxx-yyyy-zzzz (unified volume)
-	containerGroupName := fmt.Sprintf("aci-%s", workspaceID) // aci-clxxx-yyyy-zzzz
-	dnsLabel := fmt.Sprintf("ws-%s", workspaceID)            // ws-clxxx-yyyy-zzzz
+	// Azure resource names based on UUID and deployment mode
+	fileShareName := fmt.Sprintf("fs-%s", workspaceID) // fs-clxxx-yyyy-zzzz (unified volume)
 
 	resourceGroup := regionConfig.ResourceGroupName
 	if resourceGroup == "" {
@@ -104,27 +105,41 @@ func (s *EnvironmentService) CreateEnvironment(ctx context.Context, req *models.
 
 	// Goroutine 1: Create unified file share (includes workspace + home subdirectories)
 	go func() {
-		totalQuotaGB := int32(req.StorageGB + 5) // workspace quota + 5GB for home
+		// Safe conversion: validate StorageGB is non-negative and won't overflow
+		if req.StorageGB < 0 || req.StorageGB > (1<<31-1-5) {
+			volumeChan <- operationResult{name: "unified-volume", err: fmt.Errorf("workspace %s: invalid storage size: %d", workspaceID, req.StorageGB)}
+			return
+		}
+		totalQuotaGB := int32(req.StorageGB) + 5 // nolint:gosec // G115: validated above to prevent overflow
 		log.Printf("📁 [1/2] Creating unified volume: %s (%dGB) - contains workspace/ and home/", fileShareName, totalQuotaGB)
 		err := storageClient.CreateFileShare(ctx, fileShareName, totalQuotaGB)
 		volumeChan <- operationResult{name: "unified-volume", err: err}
 	}()
 
-	// Goroutine 2: Create ACI container (starts IMMEDIATELY, doesn't wait for share)
+	// Goroutine 2: Create container using deployment strategy
 	go func() {
-		// Small delay to let share start first (Azure may need it)
-		time.Sleep(500 * time.Millisecond)
+		// Wait for volume creation to complete FIRST
+		volResult := <-volumeChan
+		if volResult.err != nil {
+			// Volume creation failed, propagate error
+			aciChan <- operationResult{name: "container", err: fmt.Errorf("workspace %s: volume creation failed, skipping container creation: %w", workspaceID, volResult.err)}
+			return
+		}
 
-		containerSpec := azure.ContainerGroupSpec{
-			ContainerName:      "vscode-server",
+		// Volume created successfully, now verify it's fully propagated in Azure
+		// Poll for file share availability with exponential backoff
+		if err := s.waitForFileShareAvailability(ctx, storageClient, fileShareName, 30*time.Second); err != nil {
+			aciChan <- operationResult{name: "container", err: fmt.Errorf("workspace %s: file share not available after creation: %w", workspaceID, err)}
+			return
+		}
+
+		deploySpec := ContainerDeploymentSpec{
 			Image:              containerImage,
-			CPUCores:           req.CPUCores,
-			MemoryGB:           req.MemoryGB,
-			DNSNameLabel:       dnsLabel,
+			CPUCores:           float64(req.CPUCores),
+			MemoryGB:           float64(req.MemoryGB),
 			FileShareName:      fileShareName,
 			StorageAccountName: regionConfig.StorageAccount,
 			StorageAccountKey:  s.config.Azure.StorageAccountKey,
-			EnvironmentID:      workspaceID,
 			UserID:             req.UserID,
 			RegistryServer:     s.getRegistryServer(),
 			RegistryUsername:   s.config.RegistryUsername,
@@ -140,49 +155,46 @@ func (s *EnvironmentService) CreateEnvironment(ctx context.Context, req *models.
 			GeminiAPIKey:       req.GeminiAPIKey,
 		}
 
-		log.Printf("📦 [2/2] Creating ACI container: %s", containerGroupName)
-		err := s.azureClient.CreateContainerGroup(ctx, req.CloudRegion, resourceGroup, containerGroupName, containerSpec)
-		aciChan <- operationResult{name: "aci-container", err: err}
+		log.Printf("📦 [2/2] Creating %s container for workspace %s", s.config.Azure.DeploymentMode, workspaceID)
+		_, err := s.deploymentStrategy.CreateContainer(ctx, workspaceID, req.CloudRegion, resourceGroup, deploySpec)
+		aciChan <- operationResult{name: "container", err: err}
 	}()
 
-	// Wait for ALL operations to complete
-	volumeResult := <-volumeChan
+	// Wait for container operation to complete (volume result already consumed by goroutine 2)
 	aciResult := <-aciChan
 
 	totalTime := time.Since(startTime)
 	log.Printf("⚡⚡⚡ ALL OPERATIONS COMPLETED in %s", totalTime)
 
 	// Check for errors (cleanup on failure)
-	if volumeResult.err != nil {
-		// Try to cleanup what succeeded
-		_ = s.azureClient.DeleteContainerGroup(ctx, req.CloudRegion, resourceGroup, containerGroupName)
-		return nil, fmt.Errorf("failed to create unified file share: %w", volumeResult.err)
-	}
 	if aciResult.err != nil {
-		// Cleanup file share
-		_ = storageClient.DeleteFileShare(ctx, fileShareName)
-		return nil, fmt.Errorf("failed to create container group: %w", aciResult.err)
+		// Check if error was from volume creation or container creation
+		if aciResult.name == "container" {
+			// Could be volume or container error - check message
+			errMsg := aciResult.err.Error()
+			if strings.Contains(errMsg, "volume creation failed") {
+				return nil, fmt.Errorf("workspace %s: failed to create unified file share: %w", workspaceID, aciResult.err)
+			}
+			// Container creation failed - cleanup file share
+			_ = storageClient.DeleteFileShare(ctx, fileShareName)
+			return nil, fmt.Errorf("workspace %s: failed to create container: %w", workspaceID, aciResult.err)
+		}
 	}
 
 	// Wait for container to get FQDN
 	time.Sleep(3 * time.Second)
 
 	// Get container details
-	containerDetails, err := s.azureClient.GetContainerGroup(ctx, req.CloudRegion, resourceGroup, containerGroupName)
+	containerInfo, err := s.deploymentStrategy.GetContainer(ctx, workspaceID, req.CloudRegion, resourceGroup)
 	if err != nil {
-		log.Printf("Warning: failed to get container details: %v", err)
+		log.Printf("Warning: workspace %s: failed to get container details: %v", workspaceID, err)
 	}
 
-	// Extract FQDN (will be ws-{workspaceId}.{region}.azurecontainer.io)
+	// Generate connection URLs
 	var fqdn string
-	if containerDetails != nil &&
-		containerDetails.Properties != nil &&
-		containerDetails.Properties.IPAddress != nil &&
-		containerDetails.Properties.IPAddress.Fqdn != nil {
-		fqdn = *containerDetails.Properties.IPAddress.Fqdn
+	if containerInfo != nil {
+		fqdn = containerInfo.FQDN
 	}
-
-	// Generate connection URLs (all contain UUID via FQDN)
 	connectionURLs := generateConnectionURLs(fqdn, "")
 
 	// Build environment response
@@ -199,9 +211,9 @@ func (s *EnvironmentService) CreateEnvironment(ctx context.Context, req *models.
 
 		// Azure resource identifiers (all based on UUID)
 		AzureResourceGroup:  resourceGroup,
-		AzureContainerGroup: containerGroupName, // aci-clxxx-yyyy-zzzz
-		AzureFileShare:      fileShareName,      // fs-clxxx-yyyy-zzzz
-		AzureFQDN:           fqdn,               // ws-clxxx-yyyy-zzzz.eastus.azurecontainer.io
+		AzureContainerGroup: fmt.Sprintf("%s-%s", s.config.Azure.DeploymentMode, workspaceID),
+		AzureFileShare:      fileShareName, // fs-clxxx-yyyy-zzzz
+		AzureFQDN:           fqdn,          // ws-clxxx-yyyy-zzzz.eastus.azurecontainer.io (or ACA FQDN)
 
 		// Connection URLs (contain UUID)
 		ConnectionURLs: connectionURLs,
@@ -233,8 +245,6 @@ func (s *EnvironmentService) StartEnvironment(ctx context.Context, req *models.S
 
 	workspaceID := req.WorkspaceID
 	fileShareName := fmt.Sprintf("fs-%s", workspaceID)
-	containerGroupName := fmt.Sprintf("aci-%s", workspaceID)
-	dnsLabel := fmt.Sprintf("ws-%s", workspaceID)
 
 	resourceGroup := regionConfig.ResourceGroupName
 	if resourceGroup == "" {
@@ -246,44 +256,35 @@ func (s *EnvironmentService) StartEnvironment(ctx context.Context, req *models.S
 	// Verify unified volume exists
 	volumeExists, err := storageClient.FileShareExists(ctx, fileShareName)
 	if err != nil {
-		return nil, models.ErrInternalServer(fmt.Sprintf("failed to check volume: %v", err))
+		return nil, models.ErrInternalServer(fmt.Sprintf("workspace %s: failed to check volume: %v", workspaceID, err))
 	}
 	if !volumeExists {
-		return nil, models.ErrNotFound(fmt.Sprintf("unified volume not found: %s. Create environment first.", fileShareName))
+		return nil, models.ErrNotFound(fmt.Sprintf("workspace %s: unified volume not found: %s. Create environment first.", workspaceID, fileShareName))
 	}
 
 	log.Printf("✅ Unified volume verified: %s", fileShareName)
 
 	// Check if container already exists
-	existingContainer, err := s.azureClient.GetContainerGroup(ctx, req.CloudRegion, resourceGroup, containerGroupName)
+	existingContainer, err := s.deploymentStrategy.GetContainer(ctx, workspaceID, req.CloudRegion, resourceGroup)
 	if err == nil && existingContainer != nil {
-		return nil, models.ErrInvalidRequest(fmt.Sprintf("container already exists for workspace %s. Use stop first if needed.", workspaceID))
+		return nil, models.ErrInvalidRequest(fmt.Sprintf("workspace %s: container already exists. Use stop first if needed.", workspaceID))
 	}
 
 	// Recreate container with existing volumes (fast!)
 	log.Printf("📦 Creating new container instance with existing volumes...")
 
-	containerSpec := azure.ContainerGroupSpec{
-		ContainerName:      "vscode-server",
+	deploySpec := ContainerDeploymentSpec{
 		Image:              s.getContainerImage(req.BaseImage),
-		CPUCores:           req.CPUCores,
-		MemoryGB:           req.MemoryGB,
-		DNSNameLabel:       dnsLabel,
+		CPUCores:           float64(req.CPUCores),
+		MemoryGB:           float64(req.MemoryGB),
 		FileShareName:      fileShareName,
 		StorageAccountName: regionConfig.StorageAccount,
 		StorageAccountKey:  s.config.Azure.StorageAccountKey,
-		EnvironmentID:      workspaceID,
 		UserID:             req.UserID,
-
-		// Registry credentials
-		RegistryServer:   s.getRegistryServer(),
-		RegistryUsername: s.config.RegistryUsername,
-		RegistryPassword: s.config.RegistryPassword,
-
-		// Agent URL
-		AgentBaseURL: s.config.AgentBaseURL,
-
-		// Per-workspace secrets
+		RegistryServer:     s.getRegistryServer(),
+		RegistryUsername:   s.config.RegistryUsername,
+		RegistryPassword:   s.config.RegistryPassword,
+		AgentBaseURL:       s.config.AgentBaseURL,
 		GitHubToken:        req.GitHubToken,
 		CodeServerPassword: req.CodeServerPassword,
 		SSHPublicKey:       req.SSHPublicKey,
@@ -294,24 +295,17 @@ func (s *EnvironmentService) StartEnvironment(ctx context.Context, req *models.S
 		GeminiAPIKey:       req.GeminiAPIKey,
 	}
 
-	if err := s.azureClient.CreateContainerGroup(ctx, req.CloudRegion, resourceGroup, containerGroupName, containerSpec); err != nil {
-		return nil, models.ErrInternalServer(fmt.Sprintf("failed to create container group: %v", err))
+	containerInfo, err := s.deploymentStrategy.CreateContainer(ctx, workspaceID, req.CloudRegion, resourceGroup, deploySpec)
+	if err != nil {
+		return nil, models.ErrInternalServer(fmt.Sprintf("workspace %s: failed to create container: %v", workspaceID, err))
 	}
 
 	// Wait for FQDN
 	time.Sleep(3 * time.Second)
 
-	containerDetails, err := s.azureClient.GetContainerGroup(ctx, req.CloudRegion, resourceGroup, containerGroupName)
-	if err != nil {
-		log.Printf("Warning: failed to get container details: %v", err)
-	}
-
 	var fqdn string
-	if containerDetails != nil &&
-		containerDetails.Properties != nil &&
-		containerDetails.Properties.IPAddress != nil &&
-		containerDetails.Properties.IPAddress.Fqdn != nil {
-		fqdn = *containerDetails.Properties.IPAddress.Fqdn
+	if containerInfo != nil {
+		fqdn = containerInfo.FQDN
 	}
 
 	connectionURLs := generateConnectionURLs(fqdn, req.CodeServerPassword)
@@ -327,7 +321,7 @@ func (s *EnvironmentService) StartEnvironment(ctx context.Context, req *models.S
 		StorageGB:           req.StorageGB,
 		BaseImage:           req.BaseImage,
 		AzureResourceGroup:  resourceGroup,
-		AzureContainerGroup: containerGroupName,
+		AzureContainerGroup: fmt.Sprintf("%s-%s", s.config.Azure.DeploymentMode, workspaceID),
 		AzureFileShare:      fileShareName,
 		AzureFQDN:           fqdn,
 		ConnectionURLs:      connectionURLs,
@@ -351,22 +345,20 @@ func (s *EnvironmentService) StopEnvironment(ctx context.Context, workspaceID, r
 		resourceGroup = s.config.Azure.ResourceGroupName
 	}
 
-	containerGroupName := fmt.Sprintf("aci-%s", workspaceID)
-
-	log.Printf("🛑 Stopping workspace %s: DELETING container (keeping volumes)", workspaceID)
+	log.Printf("🛑 Stopping workspace %s: Stopping container (keeping volumes)", workspaceID)
 
 	// Check if container exists
-	_, err := s.azureClient.GetContainerGroup(ctx, region, resourceGroup, containerGroupName)
+	_, err := s.deploymentStrategy.GetContainer(ctx, workspaceID, region, resourceGroup)
 	if err != nil {
-		return models.ErrNotFound(fmt.Sprintf("container not found for workspace %s. Already stopped?", workspaceID))
+		return models.ErrNotFound(fmt.Sprintf("workspace %s: container not found. Already stopped?", workspaceID))
 	}
 
-	// DELETE container instance (not stop) - saves 95% of running costs
-	if err := s.azureClient.DeleteContainerGroup(ctx, region, resourceGroup, containerGroupName); err != nil {
-		return models.ErrInternalServer(fmt.Sprintf("failed to delete container group: %v", err))
+	// Stop container instance - for ACI it deletes, for ACA it scales to zero
+	if err := s.deploymentStrategy.StopContainer(ctx, workspaceID, region, resourceGroup); err != nil {
+		return models.ErrInternalServer(fmt.Sprintf("workspace %s: failed to stop container: %v", workspaceID, err))
 	}
 
-	log.Printf("✅ Workspace %s stopped (container deleted, unified volume persisted for fast restart)", workspaceID)
+	log.Printf("✅ Workspace %s stopped (container stopped, unified volume persisted for fast restart)", workspaceID)
 	return nil
 }
 
@@ -382,33 +374,32 @@ func (s *EnvironmentService) DeleteEnvironment(ctx context.Context, workspaceID,
 		resourceGroup = s.config.Azure.ResourceGroupName
 	}
 
-	containerGroupName := fmt.Sprintf("aci-%s", workspaceID)
 	fileShareName := fmt.Sprintf("fs-%s", workspaceID)
 
 	log.Printf("🗑️  Deleting workspace %s permanently", workspaceID)
 
 	// Check if container is running
-	container, err := s.azureClient.GetContainerGroup(ctx, region, resourceGroup, containerGroupName)
+	container, err := s.deploymentStrategy.GetContainer(ctx, workspaceID, region, resourceGroup)
 	if err == nil && container != nil {
 		if !force {
-			return models.ErrInvalidRequest(fmt.Sprintf("workspace %s is still running. Stop it first or use force=true", workspaceID))
+			return models.ErrInvalidRequest(fmt.Sprintf("workspace %s: still running. Stop it first or use force=true", workspaceID))
 		}
 		// Force delete - stop container first
 		log.Printf("⚠️  Force deleting running container for workspace %s", workspaceID)
-		if err := s.azureClient.DeleteContainerGroup(ctx, region, resourceGroup, containerGroupName); err != nil {
-			log.Printf("Warning: failed to delete container group %s: %v", containerGroupName, err)
+		if err := s.deploymentStrategy.DeleteContainer(ctx, workspaceID, region, resourceGroup); err != nil {
+			log.Printf("Warning: workspace %s: failed to delete container: %v", workspaceID, err)
 		}
 	}
 
 	// Delete unified file share (permanent data loss!)
 	storageClient, ok := s.storageClients[region]
 	if !ok {
-		return models.ErrInternalServer(fmt.Sprintf("storage client not found for region %s", region))
+		return models.ErrInternalServer(fmt.Sprintf("workspace %s: storage client not found for region %s", workspaceID, region))
 	}
 
 	// Delete unified volume (contains both workspace/ and home/ subdirectories)
 	if err := storageClient.DeleteFileShare(ctx, fileShareName); err != nil {
-		log.Printf("Warning: failed to delete unified file share %s: %v", fileShareName, err)
+		log.Printf("Warning: workspace %s: failed to delete unified file share %s: %v", workspaceID, fileShareName, err)
 	} else {
 		log.Printf("✅ Deleted unified volume: %s (workspace + home)", fileShareName)
 	}
@@ -475,4 +466,48 @@ func (s *EnvironmentService) getRegistryServer() string {
 
 	// Fallback to configured registry (Docker Hub)
 	return s.config.RegistryServer
+}
+
+// waitForFileShareAvailability polls Azure to verify file share is fully propagated
+// Uses exponential backoff: 500ms, 1s, 2s, 4s, 8s, etc.
+func (s *EnvironmentService) waitForFileShareAvailability(ctx context.Context, storageClient *azure.StorageClient, fileShareName string, timeout time.Duration) error {
+	startTime := time.Now()
+	attempt := 0
+	maxAttempts := 10
+
+	log.Printf("⏳ Verifying file share propagation: %s (timeout: %s)", fileShareName, timeout)
+
+	for attempt < maxAttempts {
+		// Check if context is cancelled or timeout exceeded
+		if time.Since(startTime) > timeout {
+			return fmt.Errorf("timeout waiting for file share '%s' to be available after %s", fileShareName, timeout)
+		}
+
+		// Check if file share exists and is accessible
+		exists, err := storageClient.FileShareExists(ctx, fileShareName)
+		if err != nil {
+			log.Printf("⚠️  Attempt %d: Error checking file share: %v", attempt+1, err)
+		} else if exists {
+			duration := time.Since(startTime)
+			log.Printf("✅ File share %s verified and ready (took %s)", fileShareName, duration)
+			return nil
+		}
+
+		// Exponential backoff: 500ms, 1s, 2s, 4s, 8s (capped at 8s)
+		backoff := time.Duration(500*(1<<attempt)) * time.Millisecond
+		if backoff > 8*time.Second {
+			backoff = 8 * time.Second
+		}
+
+		log.Printf("⏳ File share not ready yet, retrying in %s (attempt %d/%d)", backoff, attempt+1, maxAttempts)
+
+		select {
+		case <-time.After(backoff):
+			attempt++
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled while waiting for file share: %w", ctx.Err())
+		}
+	}
+
+	return fmt.Errorf("file share '%s' not available after %d attempts (%s elapsed)", fileShareName, maxAttempts, time.Since(startTime))
 }

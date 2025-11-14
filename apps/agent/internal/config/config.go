@@ -44,6 +44,12 @@ type AzureConfig struct {
 	StorageAccountKey  string
 	ContainerRegistry  string
 
+	// Deployment mode: "aci" or "aca"
+	DeploymentMode string
+
+	// Azure Container Apps configuration
+	ContainerAppsEnvironmentID string
+
 	// Multi-region support
 	Regions       []RegionConfig
 	DefaultRegion string
@@ -97,12 +103,14 @@ func Load() (*Config, error) {
 // loadAzureConfig loads Azure-specific configuration
 func loadAzureConfig() (AzureConfig, error) {
 	config := AzureConfig{
-		SubscriptionID:     getEnv("AZURE_SUBSCRIPTION_ID", ""),
-		ResourceGroupName:  getEnv("AZURE_RESOURCE_GROUP", ""),
-		StorageAccountName: getEnv("AZURE_STORAGE_ACCOUNT", ""),
-		StorageAccountKey:  getEnv("AZURE_STORAGE_KEY", ""),
-		ContainerRegistry:  getEnv("AZURE_CONTAINER_REGISTRY", ""),
-		DefaultRegion:      getEnv("AZURE_DEFAULT_REGION", "eastus"),
+		SubscriptionID:             getEnv("AZURE_SUBSCRIPTION_ID", ""),
+		ResourceGroupName:          getEnv("AZURE_RESOURCE_GROUP", ""),
+		StorageAccountName:         getEnv("AZURE_STORAGE_ACCOUNT", ""),
+		StorageAccountKey:          getEnv("AZURE_STORAGE_KEY", ""),
+		ContainerRegistry:          getEnv("AZURE_CONTAINER_REGISTRY", ""),
+		DefaultRegion:              getEnv("AZURE_DEFAULT_REGION", "eastus"),
+		DeploymentMode:             getEnv("AZURE_DEPLOYMENT_MODE", "aci"), // "aci" or "aca"
+		ContainerAppsEnvironmentID: getEnv("AZURE_ACA_ENVIRONMENT_ID", ""),
 	}
 
 	// Load multi-region configuration
@@ -222,6 +230,16 @@ func (c *Config) Validate() error {
 
 	if c.AgentBaseURL == "" {
 		return fmt.Errorf("AGENT_BASE_URL is required")
+	}
+
+	// Validate deployment mode
+	if c.Azure.DeploymentMode != "" && c.Azure.DeploymentMode != "aci" && c.Azure.DeploymentMode != "aca" {
+		return fmt.Errorf("AZURE_DEPLOYMENT_MODE must be either 'aci' or 'aca', got '%s'", c.Azure.DeploymentMode)
+	}
+
+	// If ACA mode is enabled, environment ID is required
+	if c.Azure.DeploymentMode == "aca" && c.Azure.ContainerAppsEnvironmentID == "" {
+		return fmt.Errorf("AZURE_ACA_ENVIRONMENT_ID is required when AZURE_DEPLOYMENT_MODE is 'aca'")
 	}
 
 	return nil
