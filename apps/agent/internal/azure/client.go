@@ -308,28 +308,31 @@ func (c *Client) DeleteContainerGroup(ctx context.Context, region, resourceGroup
 
 // StartContainerGroup starts a stopped ACI container group
 func (c *Client) StartContainerGroup(ctx context.Context, region, resourceGroup, name string) error {
-	_, err := c.GetACIClient(region)
-	if err != nil {
-		return err
-	}
-
-	// Note: ACI v2 SDK doesn't have Start/Stop methods
-	// Container groups auto-start when created
-	// To "start", we can check if it exists and is stopped, then recreate if needed
-	// For MVP, we'll return not implemented error
-	return fmt.Errorf("start operation not supported in ACI v2 SDK - container groups auto-start on creation")
-}
-
-// StopContainerGroup stops a running ACI container group
-func (c *Client) StopContainerGroup(ctx context.Context, region, resourceGroup, name string) error {
 	client, err := c.GetACIClient(region)
 	if err != nil {
 		return err
 	}
 
+	// Use the BeginStart method from the Azure SDK
+	_, err = client.BeginStart(ctx, resourceGroup, name, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start container group: %w", err)
+	}
+
+	return nil
+}
+
+// StopContainerGroup stops a running ACI container group
+// Stop is synchronous - it deallocates compute resources and stops billing
+func (c *Client) StopContainerGroup(ctx context.Context, region, resourceGroup, name string) error {
+	client, err := c.GetACIClient(region)
+	if err != nil {
+		return fmt.Errorf("failed to get ACI client for region %s: %w", region, err)
+	}
+
 	_, err = client.Stop(ctx, resourceGroup, name, nil)
 	if err != nil {
-		return fmt.Errorf("failed to stop container group: %w", err)
+		return fmt.Errorf("failed to stop container group %s in resource group %s: %w", name, resourceGroup, err)
 	}
 
 	return nil

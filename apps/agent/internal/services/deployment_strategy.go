@@ -88,6 +88,24 @@ func (d *DeploymentStrategy) StopContainer(ctx context.Context, workspaceID, reg
 	}
 }
 
+// StartContainer starts a stopped container using the configured deployment mode
+// For ACI: Creates a new container group (since stop deletes it)
+// For ACA: Scales the container app back up from zero
+func (d *DeploymentStrategy) StartContainer(ctx context.Context, workspaceID, region, resourceGroup string, spec ContainerDeploymentSpec) (*ContainerInfo, error) {
+	mode := d.config.Azure.DeploymentMode
+
+	log.Printf("🚀 Starting container using %s mode for workspace %s", mode, workspaceID)
+
+	switch mode {
+	case "aca":
+		return d.startWithACA(ctx, workspaceID, resourceGroup, spec)
+	case "aci":
+		return d.startWithACI(ctx, workspaceID, region, resourceGroup, spec)
+	default:
+		return nil, fmt.Errorf("workspace %s: invalid deployment mode: %s", workspaceID, mode)
+	}
+}
+
 // ContainerDeploymentSpec contains the specification for deploying a container
 type ContainerDeploymentSpec struct {
 	Image              string
@@ -275,14 +293,84 @@ func (d *DeploymentStrategy) deleteWithACA(ctx context.Context, workspaceID, res
 	return d.azureClient.DeleteContainerApp(ctx, resourceGroup, containerAppName)
 }
 
-// stopWithACI stops a container using ACI (deletes it)
+// stopWithACI stops a container using ACI (keeps it in stopped state)
 func (d *DeploymentStrategy) stopWithACI(ctx context.Context, workspaceID, region, resourceGroup string) error {
 	containerGroupName := fmt.Sprintf("aci-%s", workspaceID)
-	return d.azureClient.DeleteContainerGroup(ctx, region, resourceGroup, containerGroupName)
+	return d.azureClient.StopContainerGroup(ctx, region, resourceGroup, containerGroupName)
 }
 
-// stopWithACA stops a container using ACA (scales to zero)
+// stopWithACA stops a container using ACA (uses native Stop API)
 func (d *DeploymentStrategy) stopWithACA(ctx context.Context, workspaceID, resourceGroup string) error {
 	containerAppName := fmt.Sprintf("aca-%s", workspaceID)
 	return d.azureClient.StopContainerApp(ctx, resourceGroup, containerAppName)
+}
+
+// startWithACI starts a container using ACI (starts stopped container or creates new one)
+func (d *DeploymentStrategy) startWithACI(ctx context.Context, workspaceID, region, resourceGroup string, spec ContainerDeploymentSpec) (*ContainerInfo, error) {
+	containerGroupName := fmt.Sprintf("aci-%s", workspaceID)
+
+	// Check if container group exists
+	existingContainer, err := d.azureClient.GetContainerGroup(ctx, region, resourceGroup, containerGroupName)
+	if err != nil {
+		// Container doesn't exist, create a new one
+		log.Printf("Container group %s not found, creating new one", containerGroupName)
+		return d.createWithACI(ctx, workspaceID, region, resourceGroup, spec)
+	}
+
+	// Container exists, check its state and start it if stopped
+	log.Printf("Container group %s exists, starting it", containerGroupName)
+	if err := d.azureClient.StartContainerGroup(ctx, region, resourceGroup, containerGroupName); err != nil {
+		return nil, fmt.Errorf("failed to start container group: %w", err)
+	}
+
+	// Return existing container info
+	var fqdn string
+	if existingContainer != nil &&
+		existingContainer.Properties != nil &&
+		existingContainer.Properties.IPAddress != nil &&
+		existingContainer.Properties.IPAddress.Fqdn != nil {
+		fqdn = *existingContainer.Properties.IPAddress.Fqdn
+	}
+
+	return &ContainerInfo{
+		Name: containerGroupName,
+		FQDN: fqdn,
+		ID:   containerGroupName,
+	}, nil
+}
+
+// startWithACA starts a container using ACA (scales from zero to one)
+// Since ACA stop scales to zero, we just need to scale back up
+func (d *DeploymentStrategy) startWithACA(ctx context.Context, workspaceID, resourceGroup string, spec ContainerDeploymentSpec) (*ContainerInfo, error) {
+	containerAppName := fmt.Sprintf("aca-%s", workspaceID)
+
+	// Check if container app exists
+	existingApp, err := d.azureClient.GetContainerApp(ctx, resourceGroup, containerAppName)
+	if err != nil {
+		// Container app doesn't exist, need to create it
+		log.Printf("Container app %s not found, creating new one", containerAppName)
+		return d.createWithACA(ctx, workspaceID, "", resourceGroup, spec)
+	}
+
+	// Container app exists, just scale it back up
+	log.Printf("Container app %s exists, scaling back up from zero", containerAppName)
+	if err := d.azureClient.StartContainerApp(ctx, resourceGroup, containerAppName); err != nil {
+		return nil, fmt.Errorf("failed to start container app: %w", err)
+	}
+
+	// Return existing app info
+	var fqdn string
+	if existingApp != nil &&
+		existingApp.Properties != nil &&
+		existingApp.Properties.Configuration != nil &&
+		existingApp.Properties.Configuration.Ingress != nil &&
+		existingApp.Properties.Configuration.Ingress.Fqdn != nil {
+		fqdn = *existingApp.Properties.Configuration.Ingress.Fqdn
+	}
+
+	return &ContainerInfo{
+		Name: containerAppName,
+		FQDN: fqdn,
+		ID:   containerAppName,
+	}, nil
 }
